@@ -92,19 +92,6 @@ class ChangeSetException(GitReviewException):
         return self.__doc__ % self.e
 
 
-def parse_review_number(review):
-    parts = review.split(',')
-    if len(parts) < 2:
-        parts.append(None)
-    return parts
-
-
-def build_review_number(review, patchset):
-    if patchset is not None:
-        return '%s,%s' % (review, patchset)
-    return review
-
-
 def run_command_status(*argv, **env):
     if VERBOSE:
         print(datetime.datetime.now(), "Running:", " ".join(argv))
@@ -400,6 +387,35 @@ def get_config(config_file):
         if configParser.has_option("gerrit", "defaultrebase"):
             config['defaultrebase'] = configParser.getboolean("gerrit",
                                                               "defaultrebase")
+    else:
+        trackedbranchs_raw = run_command('git branch -vv')
+        for element in trackedbranchs_raw.split("\n"):
+            if (element.startswith('*')):
+                trackedbranchs = re.findall("\[(.*)\]",element)
+                if (trackedbranchs == []):
+                    print("Aborting.")
+                    print("No tracking branch found.")
+                    print("Please rebase/move your changes")
+                    print("and/or supply a branch to submit against")
+                    print("and try again")
+                    sys.exit(1)
+                trackedbranch = trackedbranchs[0].split('/')
+                if (len(trackedbranch) == 1):
+                    print ('Automatic review is not possible against locally tracked branches')
+                    sys.exit(1)
+                else:
+                    trackedbranch = trackedbranch[1].split(':')[0]
+                    if (trackedbranch == 'master'):
+                        print ('You are about to submit commits for review against "master"')
+                        print ('Is this really what you meant to do?')
+                        yes_no = do_input("Type 'yes' to confirm: ")
+                        if yes_no.lower().strip() != "yes":
+                            print("Aborting.")
+                            print("Please rebase/move your changes")
+                            print("and/or supply a branch to submit against")
+                            print("and try again")
+                            sys.exit(1)
+        config['defaultbranch'] = trackedbranch
     return config
 
 
@@ -455,23 +471,18 @@ def check_remote(branch, remote, hostname, port, project):
         raise
 
 
-def rebase_changes(branch, remote, interactive=True):
+def rebase_changes(branch, remote):
 
     remote_branch = "remotes/%s/%s" % (remote, branch)
 
     if not update_remote(remote):
         return False
 
-    if interactive:
-        cmd = "git rebase -i %s" % remote_branch
-    else:
-        cmd = "git rebase %s" % remote_branch
-
+    cmd = "git rebase -i %s" % remote_branch
     (status, output) = run_command_status(cmd, GIT_EDITOR='true')
     if status != 0:
         print("Errors running %s" % cmd)
-        if interactive:
-            print(output)
+        print(output)
         return False
     return True
 
@@ -518,7 +529,7 @@ def assert_one_change(remote, branch, yes, have_hook):
         use_color = "--color=%s" % color
     else:
         use_color = ""
-    cmd = "git log %s --decorate --oneline HEAD --not remotes/%s/%s --" % (
+    cmd = "git log %s --decorate --oneline HEAD --not remotes/%s/%s" % (
         use_color, remote, branch)
     (status, output) = run_command_status(cmd)
     if status != 0:
@@ -734,10 +745,10 @@ def fetch_review(review, masterbranch, remote):
         userhost = "%s@%s" % (username, hostname)
 
     review_arg = review
+    patchset_number = None
     patchset_opt = '--current-patch-set'
-
-    review, patchset_number = parse_review_number(review)
-    if patchset_number is not None:
+    if ',' in review:
+        review, patchset_number = review.split(',')
         patchset_opt = '--patch-sets'
 
     review_info = None
@@ -841,52 +852,6 @@ class DeleteBranchFailed(CommandFailed):
     EXIT_CODE = 68
 
 
-class InvalidPatchsetsToCompare(GitReviewException):
-    def __init__(self, patchsetA, patchsetB):
-        Exception.__init__(
-            self,
-            "Invalid patchsets for comparison specified (old=%s,new=%s)" % (
-                patchsetA,
-                patchsetB))
-    EXIT_CODE = 39
-
-
-def compare_review(review_spec, branch, remote, rebase=False):
-    new_ps = None    # none means latest
-
-    if '-' in review_spec:
-        review_spec, new_ps = review_spec.split('-')
-    review, old_ps = parse_review_number(review_spec)
-
-    if old_ps is None or old_ps == new_ps:
-        raise InvalidPatchsetsToCompare(old_ps, new_ps)
-
-    old_review = build_review_number(review, old_ps)
-    new_review = build_review_number(review, new_ps)
-
-    old_branch = fetch_review(old_review, branch, remote)
-    checkout_review(old_branch)
-
-    if rebase:
-        print('Rebasing %s' % old_branch)
-        rebase = rebase_changes(branch, remote, False)
-        if not rebase:
-            print('Skipping rebase because of conflicts')
-            run_command_exc(CommandFailed, 'git', 'rebase', '--abort')
-
-    new_branch = fetch_review(new_review, branch, remote)
-    checkout_review(new_branch)
-
-    if rebase:
-        print('Rebasing also %s' % new_branch)
-        if not rebase_changes(branch, remote, False):
-            print("Rebasing of the new branch failed, "
-                  "diff can be messed up (use -R to not rebase at all)!")
-            run_command_exc(CommandFailed, 'git', 'rebase', '--abort')
-
-    subprocess.check_call(['git', 'diff', old_branch])
-
-
 def finish_branch(target_branch):
     local_branch = get_branch_name(target_branch)
     if VERBOSE:
@@ -960,7 +925,7 @@ def main():
                         help="Force rebase even when not needed.")
 
     fetch = parser.add_mutually_exclusive_group()
-    fetch.set_defaults(download=False, compare=False, cherrypickcommit=False,
+    fetch.set_defaults(download=False, cherrypickcommit=False,
                        cherrypickindicate=False, cherrypickonly=False)
     fetch.add_argument("-d", "--download", dest="changeidentifier",
                        action=DownloadFlag, metavar="CHANGE",
@@ -986,14 +951,6 @@ def main():
                        help="Apply the contents of an existing gerrit "
                        "review to the working directory and prepare "
                        "for commit")
-    fetch.add_argument("-m", "--compare", dest="changeidentifier",
-                       action=DownloadFlag, metavar="CHANGE,PS[-NEW_PS]",
-                       const="compare",
-                       help="Download specified and latest (or NEW_PS) "
-                       "patchsets of an existing gerrit review into "
-                       "a branches, rebase on master "
-                       "(skipped on conflicts or when -R is specified) "
-                       "and show their differences")
 
     parser.add_argument("-u", "--update", dest="update", action="store_true",
                         help="Force updates from remote locations")
@@ -1049,10 +1006,6 @@ def main():
                  config['hostname'], config['port'], config['project'])
 
     if options.changeidentifier:
-        if options.compare:
-            compare_review(options.changeidentifier,
-                           branch, remote, options.rebase)
-            return
         local_branch = fetch_review(options.changeidentifier, branch, remote)
         if options.download:
             checkout_review(local_branch)
